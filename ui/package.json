@@ -1,0 +1,22 @@
+{
+  "name": "llamavino-ui",
+  "version": "1.0.0",
+  "description": "Interfaz Ink (React) para LlamaVino: GGUF + OpenVINO en Intel Iris Xe.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "llamavino-ui": "source/cli.js"
+  },
+  "scripts": {
+    "start": "node source/cli.js",
+    "check": "node --check source/cli.js && node --check source/app.js && node --check source/backend.js && node --check source/components.js",
+    "test:backend": "node test-backend.mjs"
+  },
+  "dependencies": {
+    "htm": "3.1.1",
+    "ink": "5.1.0",
+    "ink-spinner": "5.0.0",
+    "ink-text-input": "6.0.0",
+    "react": "18.3.1"
+  }
+}
