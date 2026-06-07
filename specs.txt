@@ -1,0 +1,4 @@
+Genera un script Python llamado LlamaVino optimizado para procesar un fichero GGUF cuantizado de LLAMA
+utilizando las librerías OpenVINO con "python -m pip install openvino" para una tarjeta gráfica  Intel(R) Iris(R) Xe Graphics y optimizaciones específicas en llama.cpp para el backend de OpenVINO en https://github.com/ggml-org/llama.cpp
+
+

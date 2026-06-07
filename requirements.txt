@@ -1,0 +1,24 @@
+# LlamaVino dependencies
+# Install with: python -m pip install -r requirements.txt
+#
+# GGUF loading requires the GenAI runtime (>= 2025.1 for native GGUF support).
+openvino>=2025.1
+openvino-genai>=2025.1
+# Used by --download to fetch GGUF models from Hugging Face.
+huggingface_hub>=0.24
+# Editor de línea de la TUI rich: menú de comandos «/», barras del prompt y
+# línea de estado (modelo, contexto y tokens).
+prompt_toolkit>=3.0
+
+# Optional: OpenTelemetry GenAI tracing (--serve). The backend runs fine without
+# it; install these to emit spans (console exporter by default, OTLP via OTEL_*):
+#   python -m pip install "opentelemetry-sdk>=1.27" "opentelemetry-semantic-conventions>=0.48b0"
+
+# Optional: Tree-sitter code structure (CodeOutline / ExtractSymbol). Only needed
+# for the code-analysis features, not for chat:
+#   python -m pip install tree-sitter tree-sitter-python
+
+# Optional: convert HF models to OpenVINO IR int4 (--convert-ir):
+#   python -m pip install "optimum-intel[openvino]"
+# Optional: hardened XML parsing for /ir rt_info (else DOCTYPE/ENTITY is rejected):
+#   python -m pip install defusedxml

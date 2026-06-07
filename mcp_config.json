@@ -1,0 +1,8 @@
+{
+  "$comment": "Servidores MCP PRE-APROBADOS. El protocolo solo referencia estos por nombre; nunca recibe comandos arbitrarios del modelo. Edita este fichero para añadir servidores de confianza.",
+  "servers": {
+    "filesystem": {
+      "command": ["python", "mcp_servers/filesystem_server.py", "--root", "."]
+    }
+  }
+}

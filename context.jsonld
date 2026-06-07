@@ -1,0 +1,32 @@
+{
+  "@context": {
+    "@version": 1.1,
+    "schema": "https://schema.org/",
+    "gen_ai": "https://opentelemetry.io/schemas/gen-ai#",
+    "llv": "https://llamavino.dev/ns/v1#",
+
+    "Message": "schema:Message",
+    "Prompt": "llv:Prompt",
+    "AIModel": "schema:SoftwareApplication",
+    "Generate": "schema:CreateAction",
+    "FileActionRequest": "llv:FileActionRequest",
+
+    "role": "schema:author",
+    "content": "schema:text",
+    "model": "gen_ai:request.model",
+    "device": "llv:device",
+    "temperature": "gen_ai:request.temperature",
+    "max_new_tokens": "gen_ai:request.max_tokens",
+    "top_p": "llv:top_p",
+    "top_k": "llv:top_k",
+    "history": "schema:hasPart",
+    "usage": "llv:usage",
+    "output_tokens": "gen_ai:usage.output_tokens",
+    "input_tokens_estimated": "gen_ai:usage.input_tokens",
+
+    "action": "llv:action",
+    "path": "schema:url",
+    "patchType": "llv:patchType",
+    "requires_elevation": "llv:requiresElevation"
+  }
+}
