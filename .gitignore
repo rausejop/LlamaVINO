@@ -26,6 +26,10 @@ _llama_vulkan.zip
 .cache/
 .claude/
 
+# Resultados generados por el benchmark (regenerables; el script sí se versiona)
+bench/resultados-*.json
+bench/resultados-*.md
+
 # Sistema
 .DS_Store
 Thumbs.db

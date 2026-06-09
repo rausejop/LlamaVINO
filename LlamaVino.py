@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -599,8 +600,14 @@ def es_modelo_ir(model_path) -> bool:
     return ruta.is_dir() and (ruta / "openvino_model.xml").is_file()
 
 
+# Carpeta para artefactos TEMPORALES regenerables (caché de compilación de OpenVINO).
+# Vive FUERA del proyecto, en C:\temp, para no llenar el disco del repo y poder
+# vaciarla sin riesgo. Configurable con la variable de entorno ``LLAMAVINO_TEMP``.
+TEMP_DIR = Path(os.environ.get("LLAMAVINO_TEMP", r"C:\temp\llamavino"))
+
 # Directorio de caché de compilación de OpenVINO (acelera recargas posteriores).
-OV_CACHE_DIR = Path("models") / ".ovcache"
+# Antes vivía en models/.ovcache (llenaba el disco del repo); ahora en TEMP_DIR.
+OV_CACHE_DIR = TEMP_DIR / "ovcache"
 
 
 def ov_plugin_config(device: str) -> dict:
@@ -739,6 +746,90 @@ def etiqueta_motor(engine_hint: str) -> str:
     }.get(engine_hint, "[dim]auto[/]")
 
 
+def _gpu_es_integrada(device: str) -> bool:
+    """¿La GPU objetivo es integrada (memoria compartida)?
+
+    En una iGPU la generación está limitada por el ancho de banda de memoria, así
+    que la CPU genera más rápido (ver ``bench/benchmark.py``). Devuelve True si no
+    hay GPU o si la GPU es integrada (caso Iris Xe); False solo si se detecta una
+    GPU **dedicada** (discrete), donde sí conviene la GPU.
+    """
+    try:
+        import openvino as ov
+        core = ov.Core()
+        gpus = [d for d in core.available_devices if d.startswith("GPU")]
+        if not gpus:
+            return True  # sin GPU: la CPU es la única (y la más rápida) opción
+        objetivo = device if device in gpus else gpus[0]
+        try:
+            tipo = str(core.get_property(objetivo, "DEVICE_TYPE")).lower()
+            if "discrete" in tipo:
+                return False
+            if "integrated" in tipo:
+                return True
+        except Exception:  # noqa: BLE001 - propiedad no disponible en este runtime
+            pass
+        nombre = str(core.get_property(objetivo, "FULL_DEVICE_NAME")).lower()
+        return any(k in nombre for k in ("iris", "uhd", "hd graphics", "integrated"))
+    except Exception:  # noqa: BLE001 - sin OpenVINO: asumimos el hardware objetivo (iGPU)
+        return True
+
+
+def resolver_velocidad(args, device: str, model_path=None) -> dict:
+    """Decide la opción **más rápida** y si la configuración pedida la respeta.
+
+    El programa elige por defecto la opción más rápida de esta máquina (en una
+    iGPU, CPU). Si el usuario fuerza otra (más lenta) por parámetros, se respeta
+    pero se **avisa** de cuál es siempre la más rápida.
+
+    Devuelve un dict con: ``recomendado`` ("cpu"/"gpu"), ``forzar_cpu`` (decisión
+    final), ``es_rapida`` (¿la config activa es la más rápida?), ``auto`` (¿se
+    eligió automáticamente?), ``etiqueta_rapida`` y ``nota`` (mensaje para mostrar).
+    """
+    integrada = _gpu_es_integrada(device)
+    recomendado = "cpu" if integrada else "gpu"
+    etiqueta_rapida = ("CPU (sin descargar capas a la iGPU)" if recomendado == "cpu"
+                       else "GPU (descarga de capas)")
+    motivo = ("en esta GPU integrada la generación está limitada por el ancho de "
+              "banda de memoria, así que la CPU genera más rápido"
+              if recomendado == "cpu"
+              else "hay una GPU dedicada que acelera la generación")
+
+    forzar_cpu_flag = bool(getattr(args, "cpu", False))
+    forzar_gpu_flag = bool(getattr(args, "gpu", False))
+    engine_pref = str(getattr(args, "engine", "auto")).lower()
+    device_pedido = str(getattr(args, "device", "AUTO")).upper()
+    ngl_pref = str(getattr(args, "n_gpu_layers", "auto")).lower()
+    ngl_forzado = ngl_pref.isdigit() and int(ngl_pref) > 0
+
+    # ¿El usuario pide explícitamente la GPU o una opción más lenta para generar?
+    pide_gpu = (forzar_gpu_flag or device_pedido.startswith("GPU")
+                or engine_pref in ("openvino", "llamacpp", "llamaserver")
+                or ngl_forzado)
+
+    if forzar_cpu_flag:
+        forzar_cpu, auto = True, False
+    elif pide_gpu:
+        forzar_cpu, auto = False, False
+    else:  # nada forzado → automático: la más rápida
+        forzar_cpu, auto = (recomendado == "cpu"), True
+
+    es_rapida = (forzar_cpu and recomendado == "cpu") or (not forzar_cpu and recomendado == "gpu")
+    activar_rapida = "--cpu o /cpu on" if recomendado == "cpu" else "--gpu o /cpu off"
+    forzar_lenta = "--gpu o /cpu off" if recomendado == "cpu" else "--cpu o /cpu on"
+    if auto:
+        nota = (f"⚡ Opción más rápida seleccionada automáticamente: {etiqueta_rapida} "
+                f"({motivo}). Para forzar la otra opción: {forzar_lenta}.")
+    elif es_rapida:
+        nota = f"⚡ Estás en la opción más rápida: {etiqueta_rapida} (forzada)."
+    else:
+        actual = "CPU" if forzar_cpu else "GPU"
+        nota = (f"⚠ Configuración actual: {actual} — más lenta para generación en esta "
+                f"máquina. La más rápida es {etiqueta_rapida}: actívala con {activar_rapida}.")
+    return {"recomendado": recomendado, "forzar_cpu": forzar_cpu, "es_rapida": es_rapida,
+            "auto": auto, "etiqueta_rapida": etiqueta_rapida, "motivo": motivo, "nota": nota}
+
+
 def crear_motor(model_path, args, device: str, *, verbose: bool = True) -> dict:
     """Elige y construye el motor de inferencia para ``model_path``.
 
@@ -756,12 +847,20 @@ def crear_motor(model_path, args, device: str, *, verbose: bool = True) -> dict:
 
     sistema = construir_sistema(model_path)  # identidad LlamaVINO + primer de ficheros
 
+    # Velocidad: por defecto se elige la opción más rápida de esta máquina (en una
+    # iGPU, CPU). Si se fuerza otra por parámetros, se respeta pero se avisa.
+    velocidad = resolver_velocidad(args, device, model_path)
+    forzar_cpu = velocidad["forzar_cpu"]
+    if forzar_cpu:
+        device = "CPU"
+
     # Directorio IR: siempre OpenVINO (carga con mmap del .bin); sin planner ni
     # respaldo a llama.cpp (llama.cpp no lee IR).
     if es_modelo_ir(model_path):
         pipe = build_pipeline(Path(model_path), device)
         return {"kind": "openvino", "obj": pipe, "plan": None, "sistema": sistema,
-                "n_gpu_layers": None, "device": f"{device} (IR, mmap)"}
+                "n_gpu_layers": None, "device": f"{device} (IR, mmap)",
+                "velocidad": velocidad}
 
     pref = getattr(args, "engine", "auto")
     n_ctx = int(getattr(args, "n_ctx", 4096))
@@ -776,6 +875,8 @@ def crear_motor(model_path, args, device: str, *, verbose: bool = True) -> dict:
             print(f"No se pudo planificar el reparto de capas: {exc}", file=sys.stderr)
 
     def _ngl() -> int:
+        if forzar_cpu:
+            return 0  # --cpu: nada a la GPU (ruta de CPU rápida)
         if str(ngl_pref).lower() == "auto":
             return plan.n_gpu_layers if plan is not None else 0
         return int(ngl_pref)
@@ -795,26 +896,28 @@ def crear_motor(model_path, args, device: str, *, verbose: bool = True) -> dict:
         except Exception:  # noqa: BLE001 - best-effort
             pass
         return {"kind": "llamaserver", "obj": engine, "plan": plan, "sistema": sistema,
-                "n_gpu_layers": ngl,
+                "n_gpu_layers": ngl, "velocidad": velocidad,
                 "device": f"llama-server (ngl={ngl}, mmap, candidatas)"}
 
     usar_llama = pref == "llamacpp"
     if pref == "auto":
         # Respaldo a llama.cpp si el modelo no lo soporta OpenVINO (pista del
-        # registro) o no cabe entero en VRAM, y hay binario disponible.
+        # registro) o no cabe entero en VRAM, y hay binario disponible. Con --cpu,
+        # la ruta de CPU rápida es llama.cpp (ngl=0): se prefiere si hay binario.
         no_cabe = plan is not None and not plan.fits_full_gpu
-        if (_engine_hint(model_path) == "llamacpp" or no_cabe) \
+        if (forzar_cpu or _engine_hint(model_path) == "llamacpp" or no_cabe) \
                 and _hay_binario_llamacpp():
             usar_llama = True
 
     def _motor_llamacpp() -> dict:
         ngl = _ngl()
-        if verbose and plan is not None:
+        if verbose and plan is not None and not forzar_cpu:
             print(plan.reason)
         engine = llama_engine.LlamaCppEngine(
             str(model_path), n_gpu_layers=ngl, n_ctx=n_ctx, use_mmap=True)
+        etiqueta = "llama.cpp (solo CPU)" if ngl == 0 else f"llama.cpp (ngl={ngl}, mmap)"
         return {"kind": "llamacpp", "obj": engine, "plan": plan, "sistema": sistema,
-                "n_gpu_layers": ngl, "device": f"llama.cpp (ngl={ngl}, mmap)"}
+                "n_gpu_layers": ngl, "device": etiqueta, "velocidad": velocidad}
 
     if usar_llama:
         return _motor_llamacpp()
@@ -840,7 +943,7 @@ def crear_motor(model_path, args, device: str, *, verbose: bool = True) -> dict:
         return _motor_llamacpp()
 
     return {"kind": "openvino", "obj": pipe, "plan": plan, "sistema": sistema,
-            "n_gpu_layers": None, "device": device}
+            "n_gpu_layers": None, "device": device, "velocidad": velocidad}
 
 
 def cerrar_motor(engine: dict) -> None:
@@ -2105,6 +2208,9 @@ CHAT_COMMANDS: list[dict] = [
      "help": "Información del modelo OpenVINO IR cargado (ficheros, config, rt_info)."},
     {"names": ["/gpu", "/offload"],
      "help": "Reparto de capas GPU/CPU calculado en tiempo real (mmap)."},
+    {"names": ["/cpu"],
+     "help": "Modo CPU rápida: /cpu on (solo CPU) · /cpu off (GPU) · /cpu (estado). "
+             "Recarga el motor con la opción más rápida de esta máquina."},
     {"names": ["/color"],
      "help": "Color de las barras: /color [red|blue|green|yellow|purple|"
              "orange|pink|cyan|default]."},
@@ -2173,6 +2279,11 @@ def _print_status(console, model_path, engine: dict, settings) -> None:
         plan = engine.get("plan")
         total = f"/{plan.block_count}" if plan else ""
         table.add_row("Capas en GPU", f"{engine['n_gpu_layers']}{total} (resto en CPU)")
+    vel = engine.get("velocidad")
+    if vel:
+        marca = "[green]sí[/]" if vel.get("es_rapida") else "[yellow]no — hay una más rápida[/]"
+        table.add_row("Opción más rápida", vel.get("etiqueta_rapida", "?"))
+        table.add_row("¿Activa la más rápida?", marca)
     table.add_row("Temperatura", str(settings["temperature"]))
     table.add_row("top_p / top_k", f"{settings['top_p']} / {settings['top_k']}")
     table.add_row(
@@ -2676,7 +2787,8 @@ class ChatTUI:
         # «/candidatas historico»): lista de {pos, elegida, lista}.
         self.hist_candidatas: list[dict] = []
         self.tokens_vivos = 0
-        self.accion = None                   # "switch" | None al salir
+        self.accion = None                   # "switch" | "config" | "cpu" | None al salir
+        self.cpu_destino = None               # destino de /cpu on|off al recargar
         self._ctx_base = 0
         self._n_tok = 0
         self._inicio = 0.0
@@ -2965,6 +3077,8 @@ class ChatTUI:
         elif cmd == "/gpu":
             await self._pager(lambda c: _show_gpu_plan(c, self.engine, self.model_path,
                                                        self.device, self.args))
+        elif cmd == "/cpu":
+            await self._cmd_cpu(texto)
         elif cmd == "/gguf":
             resto = texto.split(maxsplit=1)
             filtro, limite = _parsear_args_gguf(resto[1] if len(resto) > 1 else "")
@@ -3070,6 +3184,34 @@ class ChatTUI:
         self._log(f"Vista en vivo de candidatas {estado} "
                   "(el histórico se sigue registrando: /candidatas historico).")
         self.app.invalidate()
+
+    async def _cmd_cpu(self, texto: str):
+        """/cpu [on|off]: alterna el modo CPU rápida recargando el motor.
+
+        Sin argumento muestra el estado y cuál es la opción más rápida. ``on``
+        fuerza solo-CPU; ``off`` fuerza la GPU (más lenta en esta iGPU). El cambio
+        sale de la TUI para recargar el motor y reentra conservando la conversación.
+        """
+        vel = (self.engine or {}).get("velocidad") or {}
+        actual_cpu = bool(vel.get("forzar_cpu"))
+        resto = texto.split(maxsplit=1)
+        arg = resto[1].strip().lower() if len(resto) > 1 else ""
+        if arg not in ("", "on", "off"):
+            self._log("Uso: /cpu [on|off]")
+            return
+        if arg == "":
+            estado = "ON (solo CPU)" if actual_cpu else "OFF (GPU)"
+            self._log(f"Modo CPU rápida: {estado}. {vel.get('nota', '')}")
+            return
+        destino = (arg == "on")
+        if destino == actual_cpu:
+            self._log(f"El modo CPU ya está {'activado' if destino else 'desactivado'}.")
+            return
+        # Recarga el motor con la nueva preferencia (sale y reentra).
+        self.cpu_destino = destino
+        self.accion = "cpu"
+        self._log("Recargando el motor con la nueva opción…")
+        self.app.exit()
 
     async def _generar(self, texto: str):
         import asyncio
@@ -3202,6 +3344,9 @@ class ChatTUI:
             self.transcripcion.append(
                 "Chat listo. Escribe «/» para ver los comandos. La salida hace "
                 "scroll arriba; las barras, el prompt y el estado quedan fijos abajo.")
+            vel = (self.engine or {}).get("velocidad")
+            if vel and vel.get("nota"):
+                self.transcripcion.append(vel["nota"])
         self._refrescar()
         try:
             self.app.run()
@@ -3265,6 +3410,18 @@ def interactive_session(args) -> int:
                 except Exception as exc:  # noqa: BLE001
                     console.print(f"[red]No se pudo cargar el modelo: {exc}[/]")
                     return 1
+            continue
+        if accion == "cpu":
+            # /cpu on|off: recarga el motor con la nueva preferencia de velocidad.
+            cerrar_motor(engine)
+            args.cpu = bool(tui.cpu_destino)
+            args.gpu = not tui.cpu_destino
+            device = pick_device(args.device)
+            try:
+                engine = crear_motor(model_path, args, device)
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[red]No se pudo recargar el motor: {exc}[/]")
+                return 1
             continue
         if accion == "config":
             configure_settings(console, estado["settings"])  # editor con flechas
@@ -3372,6 +3529,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Tamaño de contexto para el motor llama.cpp (por defecto: 4096).",
     )
     parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="CPU rápida: ejecuta solo en CPU (sin descargar capas a la GPU, "
+        "ngl=0). En esta Iris Xe la generación es más rápida en CPU que en la "
+        "iGPU (limitada por ancho de banda de memoria); bajo --engine auto "
+        "prefiere llama.cpp en CPU. Equivale a --engine llamacpp --n-gpu-layers 0. "
+        "Por defecto el programa ya elige la opción más rápida automáticamente.",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Fuerza la GPU aunque en esta iGPU sea MÁS LENTA para generación. "
+        "Por defecto se elige la opción más rápida; usa esto para anularlo.",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=512,
@@ -3414,6 +3586,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _validar_args(args) -> str | None:
     """Valida rangos de los flags. Devuelve un mensaje de error o None si todo OK."""
+    if getattr(args, "cpu", False) and getattr(args, "gpu", False):
+        return "--cpu y --gpu son mutuamente excluyentes (uno fuerza CPU, el otro GPU)."
     if not (0.0 <= args.temperature <= 2.0):
         return "--temperature debe estar entre 0.0 y 2.0."
     if not (0.0 <= args.top_p <= 1.0):
@@ -3505,6 +3679,9 @@ def main(argv: list[str] | None = None) -> int:
     import openvino_genai as ov_genai
 
     engine = crear_motor(args.model, args, device)
+    vel = engine.get("velocidad")
+    if vel and vel.get("nota"):
+        print(vel["nota"], file=sys.stderr)
 
     def streamer(subword: str) -> None:
         if not args.no_stream:

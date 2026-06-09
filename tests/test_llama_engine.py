@@ -11,6 +11,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -134,8 +135,13 @@ class FindBinaryTests(unittest.TestCase):
 
     def test_missing_raises(self):
         os.environ["LLAMA_CPP_BIN"] = str(Path(__file__).parent / "no_existe_xyz.exe")
-        with self.assertRaises(le.LlamaCppError):
-            le.find_binary()
+        # Aísla también las carpetas vendor/ y el PATH: si hay un binario real en
+        # el repo (vendor/llama.cpp/) o instalado en el sistema, find_binary lo
+        # encontraría y no lanzaría. Para esta prueba los anulamos.
+        with mock.patch.object(le, "_VENDOR_DIRS", ()), \
+                mock.patch.object(le.shutil, "which", return_value=None):
+            with self.assertRaises(le.LlamaCppError):
+                le.find_binary()
 
 
 class EngineConstructionTests(unittest.TestCase):

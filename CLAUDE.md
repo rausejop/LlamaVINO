@@ -55,6 +55,14 @@ Key references:
   `OffloadPlan` (`n_gpu_layers`). No model load. Tests in `tests/test_layer_planner.py`.
 - Backend protocol exposes both as JSON-LD requests (`FileActionRequest`,
   `CodeOutline`, `ExtractSymbol`), all directory-confined via `_confined_path`.
+- `bench/benchmark.py` — backend benchmark (`llama-bench`): compares **llama.cpp · Vulkan
+  (GPU)** vs **CPU** (`-ngl 0`) vs optional **SYCL** (`LLAMA_SYCL_BENCH`) vs optional
+  **OpenVINO** (`--openvino`), over the local GGUFs. Saves `bench/resultados-*.md/.json`.
+  Finding on this Iris Xe: **CPU wins token generation** (1B: ~25 vs ~15 t/s Vulkan vs 9.5
+  OpenVINO; 7B: ~2× CPU) — the iGPU shares the memory bus, so generation is
+  bandwidth-bound; GPU only wins prefill (`pp`). Drove the `--cpu` flag and the
+  fastest-by-default behavior. `--registrar-perf` writes each model's CPU tg into
+  `perf_db` (`motor=llamacpp`, GGUF). No external deps.
 - `requirements.txt` — `openvino` + `openvino-genai` (>= 2025.1); OTel is optional.
 - `specs.txt` — the original Spanish project brief.
 
@@ -104,7 +112,7 @@ cd ui; node test-backend.mjs                      # test the Node<->Python bridg
   `--temperature`).
 - **Chat slash commands**: both UIs mirror Claude Code's set, adapted to the local engine
   (`CHAT_COMMANDS`): `/help /clear /compact /config /model /save /cost /status /gguf /ir
-  /gpu /color /doctor /mcp /candidatas /exit`. Both UIs show a filtered, arrow-navigable autocomplete menu
+  /gpu /cpu /color /doctor /mcp /candidatas /exit`. Both UIs show a filtered, arrow-navigable autocomplete menu
   when the input starts with `/` — the Ink UI via `slashMatches`/`SlashMenu`, the rich TUI
   via **prompt_toolkit** (`_crear_editor`: a `Completer` + `complete_while_typing` + a
   `Lexer`). Commands render in blue; `/color` offers its color options on Tab.
@@ -162,6 +170,21 @@ cd ui; node test-backend.mjs                      # test the Node<->Python bridg
   `etiqueta_motor`: green *OpenVINO* vs yellow *llama.cpp (respaldo)* vs dim *auto*. Under
   `auto`, a `llamacpp`-hinted model (e.g. Mistral v0.3) goes straight to llama.cpp, skipping
   the doomed OpenVINO attempt — both in `crear_motor` (rich TUI) and the `Load` handler (Ink).
+- **Fastest-option auto-default + `--cpu`/`--gpu`/`/cpu`**: `resolver_velocidad(args, device)`
+  picks the **fastest** config for this machine and **enables it by default**; `crear_motor`
+  stores the decision in `engine["velocidad"]` (`{recomendado, forzar_cpu, es_rapida, auto,
+  etiqueta_rapida, nota}`). `_gpu_es_integrada(device)` (OpenVINO `DEVICE_TYPE`/name) → on an
+  **integrated GPU** (Iris Xe) the recommendation is **CPU** (generation is bandwidth-bound;
+  see `bench/benchmark.py`). With nothing forced, it auto-selects CPU (`forzar_cpu` → `_ngl()`
+  returns 0, OpenVINO `device="CPU"`, `auto` biases to **llama.cpp** when a binary exists;
+  label `llama.cpp (solo CPU)`). Forcing a slower option (`--gpu`, `--device GPU`, explicit
+  `--engine`/`--n-gpu-layers>0`) is honored but **warns** which option is fastest. `--cpu`
+  forces CPU; `--gpu` forces GPU (mutually exclusive, checked in `_validar_args`). The `nota`
+  is shown: one-shot → stderr; rich TUI → first transcript line (on start, `/model` switch and
+  `/cpu` reload); `/status` adds *Opción más rápida* rows. Chat command **`/cpu on|off`**
+  (`_cmd_cpu`) toggles the mode by reloading the engine via `accion="cpu"` (handled in
+  `interactive_session`: sets `args.cpu`/`args.gpu`, re-creates the engine, re-enters keeping
+  the conversation). Not wired into `--serve`/Ink (which don't call `crear_motor`).
   Local (non-registry) GGUFs are detected by reading the header cheaply
   (`gguf_reader.read_scalar_metadata`, which skips array bodies via `_skip_array`):
   `_detectar_motor_gguf` maps `general.architecture` (+ Mistral/Mixtral name check) to a
@@ -185,9 +208,12 @@ cd ui; node test-backend.mjs                      # test the Node<->Python bridg
   generate/compact `except`) so engine errors show in-chat instead of crashing the event
   loop. Interactive settings + bar color persist to `.llamavino.json`
   (`cargar_ajustes`/`guardar_ajustes`, applied in `ChatTUI.__init__`, saved on
-  `/config`/`/color`). `ov_plugin_config` also sets `CACHE_DIR=models/.ovcache` to cache
-  compiled models for fast reloads. `_ajustar_hf()` lowers HF Hub log noise (and `HF_TOKEN`
-  is used automatically). Top-level `README.md` + `.gitignore` added.
+  `/config`/`/color`). `ov_plugin_config` sets `CACHE_DIR` to **`TEMP_DIR/ovcache`** to cache
+  compiled models for fast reloads. `TEMP_DIR` = regenerable-temp base, default
+  **`C:\temp\llamavino`** (override with env `LLAMAVINO_TEMP`) — kept **outside the repo** so
+  the compiled-model cache (can reach 10–15 GB) doesn't fill the project disk and can be
+  wiped freely (`rm -rf C:\temp\llamavino`). `_ajustar_hf()` lowers HF Hub log noise (and
+  `HF_TOKEN` is used automatically). Top-level `README.md` + `.gitignore` added.
 - **Arrow-key selectors**: `_picker_lista(lineas, get_help=…)` is a reusable full-screen
   prompt_toolkit list (Buffer + `cursorline`, scrolls; ↑/↓ + PageUp/Down, Enter, q/Esc) with
   a per-item help line. Used by `interactive_select_model` (with `_fila_modelo` columns) and
